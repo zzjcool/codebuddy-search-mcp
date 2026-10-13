@@ -24,14 +24,34 @@
 - Node.js >= 18（有内置 fetch）
 - 一个 CodeBuddy 账号（腾讯 SSO / 微信 / 邮箱均可，即能登录 [copilot.tencent.com](https://copilot.tencent.com) 的账号）
 
-### 1. 获取代码
+### 方式一：npx 直跑（推荐，零安装）
+
+公开仓库无需 clone，MCP 客户端直接注册：
+
+```json
+"codebuddy-search": {
+  "type": "stdio",
+  "command": "npx",
+  "args": ["-y", "github:zzjcool/codebuddy-search-mcp"]
+}
+```
+
+首次启动时 npx 自动拉取并缓存到 `~/.npm/_npx/`，之后每次直接跑缓存。
+
+> ⚠️ 私有仓库：npx 默认拒绝 git 依赖。两种解法：
+> 1. `npm config set allow-git all`（全局放行）
+> 2. 保持 clone 方式（见方式二）
+
+> 📌 锁版本：把 `github:zzjcool/codebuddy-search-mcp` 换成 `github:zzjcool/codebuddy-search-mcp#v1.2.0`（用 tag），避免上游更新引入意外变化。
+
+### 方式二：clone 安装
 
 ```bash
 git clone git@github.com:zzjcool/codebuddy-search-mcp.git
 cd codebuddy-search-mcp
 ```
 
-### 2. 注册到 MCP 客户端
+### 注册到 MCP 客户端
 
 **pi**（`~/.pi/agent/mcp.json`）：
 
@@ -40,22 +60,27 @@ cd codebuddy-search-mcp
   "mcpServers": {
     "codebuddy-search": {
       "type": "stdio",
-      "command": "node",
-      "args": ["/绝对路径/codebuddy-search-mcp/index.js"]
+      "command": "npx",
+      "args": ["-y", "github:zzjcool/codebuddy-search-mcp"]
     }
   }
 }
 ```
 
+（clone 方式则用 `"command": "node", "args": ["/绝对路径/codebuddy-search-mcp/index.js"]`）
+
 **Claude Code**：
 
 ```bash
+# npx 方式
+claude mcp add codebuddy-search -- npx -y github:zzjcool/codebuddy-search-mcp
+# clone 方式
 claude mcp add codebuddy-search -- node /绝对路径/codebuddy-search-mcp/index.js
 ```
 
-**Cursor / 其他 MCP 客户端**：同 stdio 方式注册 `node <绝对路径>/index.js`。
+**Cursor / 其他 MCP 客户端**：同 stdio 方式注册。
 
-### 3. 登录（二选一）
+### 登录（二选一）
 
 **方式 A：MCP 内置 OAuth 登录（推荐）**——不依赖 codebuddy CLI：
 
@@ -78,7 +103,7 @@ chmod 600 ~/.codebuddy-search-mcp/key
 # 或者环境变量：export CODEBUDDY_API_KEY=ck_你的key
 ```
 
-### 4. 验证
+### 验证
 
 ```
 > 用 codebuddy 搜一下 "Model Context Protocol 最新规范"
