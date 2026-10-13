@@ -1,0 +1,24 @@
+{
+  "name": "codebuddy-search-mcp",
+  "version": "1.2.0",
+  "description": "CodeBuddy web search / web fetch as a standalone MCP server — direct HTTP, no CLI, built-in OAuth login & auto-refresh",
+  "main": "index.js",
+  "bin": {
+    "codebuddy-search-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test:login": "echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"cb_login\",\"arguments\":{}}}' | node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "codebuddy",
+    "web-search",
+    "tencent",
+    "model-context-protocol"
+  ],
+  "license": "MIT"
+}
