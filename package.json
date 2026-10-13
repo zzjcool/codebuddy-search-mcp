@@ -4,7 +4,7 @@
   "description": "CodeBuddy web search / web fetch as a standalone MCP server — direct HTTP, no CLI, built-in OAuth login & auto-refresh",
   "main": "index.js",
   "bin": {
-    "codebuddy-search-mcp": "./index.js"
+    "codebuddy-search-mcp": "index.js"
   },
   "files": [
     "index.js",
