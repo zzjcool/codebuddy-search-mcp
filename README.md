@@ -215,3 +215,7 @@ OAuth token 过期且 refresh 失效（长期未用），重新 `cb_login{trigge
 ## License
 
 MIT
+
+---
+
+> **ℹ️ Moved**: development continues in [search-mcp-hub](https://github.com/zzjcool/search-mcp-hub) (`packages/codebuddy-search-mcp`). This repo is the v1–v4 history archive. npm publishes continue from the monorepo.
