@@ -34,6 +34,15 @@
  *   cb_web_search   — 联网搜索
  *   cb_web_fetch    — 网页正文抓取（markdown）
  *
+ * HTTP server 模式（codebuddy-search-mcp serve）— 实现标准 MCP OAuth（RFC 9728/7591/7636），
+ * 使 `pi mcp login` 等宿主原生登录可用：
+ *   POST /mcp                          Streamable HTTP MCP 端点（Bearer 鉴权）
+ *   GET  /.well-known/oauth-protected-resource
+ *   GET  /.well-known/oauth-authorization-server
+ *   POST /register                     动态客户端注册（RFC 7591，public client）
+ *   GET  /authorize                    授权码端点（PKCE S256），背后调 CodeBuddy 浏览器登录
+ *   POST /token                        授权码换 token / refresh_token 续期（转发 CodeBuddy refresh）
+ *
  * 登录态感知（stdio server 无法走宿主的 `pi mcp login`，那只支持 HTTP+OAuth server）：
  *   - initialize 返回 instructions，首行含当前鉴权状态；pi 等宿主会把它放进 system prompt，
  *     模型开机即知是否已登录。
@@ -44,6 +53,8 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const http = require("node:http");
+const crypto = require("node:crypto");
 const { exec } = require("node:child_process");
 
 const API_BASE =
@@ -63,6 +74,10 @@ const STATE_DIR =
   process.env.CODEBUDDY_SEARCH_STATE_DIR || path.join(os.homedir(), ".codebuddy-search-mcp");
 const KEY_FILE = path.join(STATE_DIR, "key");
 const FRESHNESS_RE = /^(?:d(?:[1-9]|[12]\d|30)?|m(?:[1-9]|1[0-2])?|y[1-5]?)$/;
+
+/* serve 模式配置（提前声明：cliMain 在模块加载完成前即被调用） */
+const HTTP_PORT = parseInt(process.env.PORT || "3435", 10);
+const HTTP_HOST = process.env.HOST || "127.0.0.1";
 
 /* ---------------- OAuth 登录态（CLI 共享） ---------------- */
 
@@ -598,11 +613,16 @@ async function cliMain() {
       console.log(`  refresh token 至 ${new Date(a.refreshExpiresAt).toISOString()}`);
     process.exit(0);
   }
+  if (cmd === "serve") {
+    startHttpServer(); // 常驻
+    return;
+  }
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
-    console.log("用法: codebuddy-search-mcp [status|login]  (无参数 = MCP stdio server 模式)");
+    console.log("用法: codebuddy-search-mcp [status|login|serve]  (无参数 = MCP stdio server 模式)");
+    console.log("  serve  启动 HTTP MCP server（含标准 MCP OAuth，供 `pi mcp login` 等宿主登录）");
     process.exit(0);
   }
-  console.error(`未知子命令: ${cmd}。用法: codebuddy-search-mcp [status|login]`);
+  console.error(`未知子命令: ${cmd}。用法: codebuddy-search-mcp [status|login|serve]`);
   process.exit(1);
 }
 
@@ -657,9 +677,10 @@ if (process.argv.length > 2) {
   startMcp();
 }
 
-async function handleRpc(msg) {
+/** 统一处理一条 MCP 消息，返回响应对象（通知返回 null）。stdio 与 HTTP 两种传输共用。 */
+async function mcpResponse(msg) {
   if (msg.method === "initialize") {
-    return rpcSend({
+    return {
       jsonrpc: "2.0",
       id: msg.id,
       result: {
@@ -668,35 +689,438 @@ async function handleRpc(msg) {
         instructions: buildInstructions(), // 首行含鉴权状态，宿主会放进 system prompt
         serverInfo: { name: "codebuddy-search-mcp", version: VERSION },
       },
-    });
+    };
   }
-  if (msg.method === "notifications/initialized") return;
+  if (msg.method === "notifications/initialized") return null;
   if (msg.method === "tools/list") {
-    return rpcSend({ jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } });
+    return { jsonrpc: "2.0", id: msg.id, result: { tools: TOOLS } };
   }
   if (msg.method === "tools/call") {
     const { name, arguments: args = {} } = msg.params || {};
     try {
       const result = await handleCall(name, args);
-      rpcSend({
+      return {
         jsonrpc: "2.0",
         id: msg.id,
         result: { content: [{ type: "text", text: JSON.stringify(result, null, 1) }] },
-      });
+      };
     } catch (e) {
-      rpcSend({
+      return {
         jsonrpc: "2.0",
         id: msg.id,
         result: { content: [{ type: "text", text: `错误: ${e.message}` }], isError: true },
-      });
+      };
     }
-    return;
   }
   if (msg.id !== undefined) {
-    return rpcSend({
-      jsonrpc: "2.0",
-      id: msg.id,
-      error: { code: -32601, message: `method not found: ${msg.method}` },
-    });
+    return { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `method not found: ${msg.method}` } };
   }
+  return null;
+}
+
+async function handleRpc(msg) {
+  const r = await mcpResponse(msg);
+  if (r) rpcSend(r);
+}
+
+/* ---------------- HTTP server 模式（标准 MCP OAuth，供 pi mcp login 等宿主） ----------------
+ *
+ * 设计要点：
+ *   - 本地 HTTP MCP server（默认 127.0.0.1:3435，--port/--host 可调），Streamable HTTP，单 JSON-RPC 消息。
+ *   - OAuth：对外是标准 RFC 9728 + 7591 + 7636（PKCE S256）授权服务器；对内把
+ *     授权码流桥接到 CodeBuddy 私有浏览器登录（auth/state → auth/token 轮询 → 写 .info 文件）。
+ *     宿主（pi 等）拿到的 access/refresh token 即 CodeBuddy token，与 CLI 登录态同源。
+ *   - /token 的 refresh_token grant 转发 CodeBuddy /v2/plugin/auth/token/refresh，
+ *     并同步写回 .info，使 HTTP 与 stdio/CLI 三端共享同一登录态。
+ *   - 凭据为 opaque 随机 token，服务端映射验证；注册客户端/授权请求存内存，
+ *     access/refresh token 本身无状态存储。serve 重启后需重新 login（pi 会自动提示）。
+ *     （持久化 CLIENTS 可选：注册信息也可重新注册获得，代价只是 pi 端 sign-in 一次。）
+ */
+
+const AS_ISSUER = `http://${HTTP_HOST === "0.0.0.0" ? "127.0.0.1" : HTTP_HOST}:${HTTP_PORT}`;
+
+// 内存态：已注册客户端 / 进行中的授权请求 / 已签发 token
+const CLIENTS = new Map(); // clientId -> {client_id, client_name, redirect_uris, created_at}
+
+// 注册客户端落盘（重启 serve 后 pi 复用旧 client_id 时仍可验证）
+const CLIENT_STORE = path.join(STATE_DIR, "oauth-clients.json");
+function saveClient(c) {
+  try {
+    const all = readClientStore();
+    all[c.client_id] = c;
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(CLIENT_STORE, JSON.stringify(all));
+  } catch {}
+}
+function readClientStore() {
+  try {
+    return JSON.parse(fs.readFileSync(CLIENT_STORE, "utf8")) || {};
+  } catch {
+    return {};
+  }
+}
+function loadClient(clientId) {
+  const c = readClientStore()[clientId];
+  if (c) CLIENTS.set(clientId, c);
+  return c || null;
+}
+const PENDING = new Map(); // state -> {code_challenge, redirect_uri, scope, client_id, expires}
+const TOKENS = new Map(); // access token -> {codeBuddyAccessToken, expiresAt}
+
+function b64url(buf) {
+  return Buffer.from(buf).toString("base64url");
+}
+
+function logSrv(...a) {
+  process.stderr.write(a.join(" ") + "\n");
+}
+
+function validateRedirect(uri) {
+  // RFC 8252 loopback：host 必须是 localhost / 127.0.0.1 / [::1]，且 http
+  let u;
+  try {
+    u = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:") return false;
+  return ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname === "::1" ? "[::1]" : u.hostname) ||
+    u.hostname === "localhost";
+}
+
+function baseMetadata() {
+  return {
+    issuer: AS_ISSUER,
+    authorization_endpoint: `${AS_ISSUER}/authorize`,
+    token_endpoint: `${AS_ISSUER}/token`,
+    registration_endpoint: `${AS_ISSUER}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+  };
+}
+
+/** 从 .info 提取 CodeBuddy auth（必须可用，否则登录失败） */
+async function ensureCodeBuddyAuth() {
+  const info = readOauthInfo();
+  if (!info) throw new Error("无 CodeBuddy 登录态（先在终端完成一次 npx codebuddy-search-mcp login）");
+  const a = info.data.auth;
+  if (a.expiresAt > Date.now() + 60_000) return { info, auth: a };
+  const fresh = await refreshOauth(info);
+  return { info, auth: fresh };
+}
+
+function tokenTTL(auth) {
+  const ms = auth.expiresAt ? auth.expiresAt - Date.now() - 60_000 : 3600_000;
+  return Math.max(300_000, Math.min(ms, 3600_000)); // 5min ~ 1h
+}
+
+function startHttpServer() {
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const p = url.pathname;
+    try {
+      // ---------- discovery（RFC 9728 / RFC 8414，MCP 客户端兼容 OpenID 风格字段名） ----------
+      if (req.method === "GET" && p === "/.well-known/oauth-protected-resource") {
+        return sendJson(res, 200, {
+          resource: `${AS_ISSUER}/mcp`,
+          authorization_servers: [AS_ISSUER],
+          scopes_supported: ["codebuddy:search"],
+          resource_documentation: `${AS_ISSUER}/help`,
+          resource_name: "codebuddy-search-mcp",
+        });
+      }
+      if (req.method === "GET" && (p === "/.well-known/oauth-authorization-server" || p === "/.well-known/openid-configuration")) {
+        const m = {
+          ...baseMetadata(),
+          registration_endpoint: `${AS_ISSUER}/register`,
+        };
+        return sendJson(res, 200, m);
+      }
+
+      // ---------- 动态客户端注册（RFC 7591，public client） ----------
+      if (p === "/register" && req.method === "POST") {
+        const body = await readBody(req);
+        const redirect = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter(validateRedirect) : [];
+        if (!redirect.length) return sendJson(res, 400, { error: "invalid_redirect_uri", error_description: "redirect_uris 必须是 http(s) loopback" });
+        const clientId = "cbmcp-" + b64url(crypto.randomBytes(16));
+        const c = {
+          client_id: clientId,
+          client_name: body.client_name || "MCP client",
+          redirect_uris: redirect,
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          token_endpoint_auth_method: "none",
+          client_id_issued_at: Math.floor(Date.now() / 1000),
+        };
+        CLIENTS.set(clientId, c);
+        saveClient(c);
+        return sendJson(res, 201, c);
+      }
+
+      // ---------- 授权端点（GET /authorize，PKCE S256） ----------
+      if (p === "/authorize" && req.method === "GET") {
+        const q = url.searchParams;
+        const clientId = q.get("client_id");
+        const redirectUri = q.get("redirect_uri");
+        const challenge = q.get("code_challenge");
+        const method = q.get("code_challenge_method") || "S256";
+        const state = q.get("state") || "";
+        const scope = q.get("scope") || "";
+        let client = CLIENTS.get(clientId) || loadClient(clientId);
+        if (!client && redirectUri && validateRedirect(redirectUri)) {
+          // 兜底：客户端缓存了注册信息但本进程/存储丢失（loopback redirect 本地可信），自动补注册
+          client = {
+            client_id: clientId,
+            client_name: "MCP client",
+            redirect_uris: [redirectUri],
+            grant_types: ["authorization_code", "refresh_token"],
+            response_types: ["code"],
+            token_endpoint_auth_method: "none",
+          };
+          CLIENTS.set(clientId, client);
+          saveClient(client);
+        }
+        if (!client || !redirectUri || !client.redirect_uris.includes(redirectUri)) {
+          return sendJson(res, 400, { error: "invalid_request", error_description: "client_id/redirect_uri 未注册或不匹配" });
+        }
+        if (!challenge || method !== "S256") {
+          // 必须带 PKCE；错误回传给已验证的 redirect_uri
+          const errUrl = new URL(redirectUri);
+          errUrl.searchParams.set("error", "invalid_request");
+          errUrl.searchParams.set("error_description", "code_challenge (S256) required");
+          if (state) errUrl.searchParams.set("state", state);
+          res.writeHead(302, { Location: errUrl.toString() });
+          return res.end();
+        }
+        const txn = "tx-" + b64url(crypto.randomBytes(16));
+        PENDING.set(txn, {
+          code_challenge: challenge,
+          redirect_uri: redirectUri,
+          state,
+          scope,
+          client_id: clientId,
+          expires: Date.now() + 300_000,
+        });
+        const authUrl = `${AS_ISSUER}/authorize/confirm?txn=${encodeURIComponent(txn)}`;
+        if (q.get("response_type") !== "code") {
+          const errUrl = new URL(redirectUri);
+          errUrl.searchParams.set("error", "unsupported_response_type");
+          if (state) errUrl.searchParams.set("state", state);
+          res.writeHead(302, { Location: errUrl.toString() });
+          return res.end();
+        }
+        // 302 到登录确认页（该页自动发起 CodeBuddy 浏览器登录）
+        res.writeHead(302, { Location: authUrl });
+        return res.end();
+      }
+
+      // ---------- 登录确认页：自动触发 CodeBuddy OAuth 浏览器登录 ----------
+      if (p === "/authorize/confirm" && req.method === "GET") {
+        const txn = url.searchParams.get("txn");
+        const t = PENDING.get(txn);
+        if (!t || t.expires < Date.now()) {
+          return sendHtml(res, 400, "<h3>登录请求已过期，请重试 pi mcp login</h3>");
+        }
+        if (t.error) {
+          return sendHtml(res, 500, `<h3>CodeBuddy 登录失败：${t.error}</h3><p>请重试 pi mcp login</p>`);
+        }
+        if (t.done && !t.code) {
+          // 登录完成：生成授权码，302 回宿主 callback（同机 loopback 可达）
+          t.code = "ac-" + b64url(crypto.randomBytes(24));
+          t.codeExpires = Date.now() + 120_000;
+          const cb = new URL(t.redirect_uri);
+          cb.searchParams.set("code", t.code);
+          if (t.state) cb.searchParams.set("state", t.state);
+          res.writeHead(302, { Location: cb.toString() });
+          return res.end();
+        }
+        if (t.started) {
+          return sendHtml(res, 200, "<h3>CodeBuddy 登录处理中…（浏览器完成授权后此页自动刷新）</h3><script>setTimeout(()=>location.reload(),3000)</script>");
+        }
+        // 快路径：已有有效 CodeBuddy 登录态（含可刷新）则直接复用，不再开浏览器
+        try {
+          await ensureCodeBuddyAuth();
+          t.done = true;
+        } catch {
+          t.started = false;
+        }
+        if (t.done) {
+          // 登录完成：生成授权码，302 回宿主 callback（同机 loopback 可达）
+          t.code = "ac-" + b64url(crypto.randomBytes(24));
+          t.codeExpires = Date.now() + 120_000;
+          const cb = new URL(t.redirect_uri);
+          cb.searchParams.set("code", t.code);
+          if (t.state) cb.searchParams.set("state", t.state);
+          res.writeHead(302, { Location: cb.toString() });
+          return res.end();
+        }
+        t.started = true;
+        browserLogin({
+          onAuthUrl: (authUrl) =>
+            logSrv(`[serve] ${new Date().toISOString().slice(11, 19)} 浏览器登录 URL: ${authUrl}`),
+        })
+          .then(() => {
+            t.done = true;
+          })
+          .catch((e) => {
+            t.error = e.message || String(e);
+          });
+        return sendHtml(res, 200, "<h3>已打开浏览器进行 CodeBuddy 登录…完成后此页会自动跳转</h3><script>setTimeout(()=>location.reload(),3000)</script>");
+      }
+
+      // ---------- token 端点（授权码 + refresh_token） ----------
+      if (p === "/token" && req.method === "POST") {
+        const body = await readBody(req);
+        const grant = body.grant_type;
+        if (grant === "authorization_code") {
+          const code = body.code || "";
+          const entry = [...PENDING.entries()].find(([, v]) => v.code === code && v.codeExpires > Date.now());
+          if (!entry) return sendJson(res, 400, { error: "invalid_grant" });
+          const [txn, t] = entry;
+          if (body.redirect_uri !== t.redirect_uri) return sendJson(res, 400, { error: "invalid_grant", error_description: "redirect_uri 不匹配" });
+          if (!body.code_verifier) return sendJson(res, 400, { error: "invalid_request", error_description: "code_verifier required" });
+          const expect = b64url(crypto.createHash("sha256").update(body.code_verifier).digest());
+          if (expect !== t.code_challenge) return sendJson(res, 400, { error: "invalid_grant", error_description: "PKCE 校验失败" });
+          if (t.error) {
+            PENDING.delete(txn);
+            return sendJson(res, 400, { error: "server_error", error_description: `CodeBuddy 登录失败: ${t.error}` });
+          }
+          if (!t.done) return sendJson(res, 400, { error: "authorization_pending", error_description: "CodeBuddy 浏览器登录尚未完成" });
+          PENDING.delete(txn);
+          return await issueToken(res);
+        }
+        if (grant === "refresh_token") {
+          const rt = body.refresh_token || "";
+          try {
+            const payload = JSON.parse(Buffer.from(rt.replace(/^cbmcp-/, ""), "base64url").toString("utf8"));
+            if (payload.p !== "rt" || payload.k !== "cb") throw new Error("bad");
+            await ensureCodeBuddyAuth(); // 先确保 CodeBuddy 侧可用（顺带触发转发 refresh）
+            return await issueToken(res);
+          } catch {
+            return sendJson(res, 400, { error: "invalid_grant", error_description: "refresh token 无效或 CodeBuddy 登录态不可用" });
+          }
+        }
+        return sendJson(res, 400, { error: "unsupported_grant_type" });
+      }
+
+      // ---------- MCP 端点（Streamable HTTP，Bearer 鉴权） ----------
+      if (p === "/mcp" || p === "/") {
+        if (p !== "/mcp") {
+          if (req.method === "GET") {
+            return sendJson(res, 200, {
+              server: "codebuddy-search-mcp",
+              mode: "http",
+              mcp_endpoint: "/mcp",
+              oauth: true,
+              usage: "pi mcp add codebuddy-search --url http://127.0.0.1:" + HTTP_PORT + "/mcp && pi mcp login codebuddy-search",
+            });
+          }
+        }
+        if (req.method === "POST") {
+          const auth = req.headers.authorization || "";
+          const m = /^Bearer\s+(.+)$/.exec(auth);
+          const tok = m && TOKENS.get(m[1]);
+          if (!tok) {
+            res.writeHead(401, {
+              "WWW-Authenticate": `Bearer resource_metadata="${AS_ISSUER}/.well-known/oauth-protected-resource"`,
+              "Content-Type": "application/json",
+            });
+            return res.end(JSON.stringify({ error: "unauthorized", hint: "请通过宿主执行 pi mcp login codebuddy-search" }));
+          }
+          if (tok.expiresAt < Date.now()) {
+            TOKENS.delete(m[1]);
+            res.writeHead(401, {
+              "WWW-Authenticate": `Bearer resource_metadata="${AS_ISSUER}/.well-known/oauth-protected-resource"`,
+              "Content-Type": "application/json",
+            });
+            return res.end(JSON.stringify({ error: "invalid_token" }));
+          }
+          const msg = await readBody(req);
+          const r = await mcpResponse(msg);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify(r ?? { jsonrpc: "2.0", result: {} }));
+        }
+        res.writeHead(405);
+        return res.end();
+      }
+
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("not found");
+    } catch (e) {
+      logSrv(`[serve] 处理 ${req.method} ${p} 出错:`, e.message || e);
+      if (!res.headersSent) sendJson(res, 500, { error: "server_error", error_description: String(e.message || e) });
+      else res.end();
+    }
+  });
+
+  server.listen(HTTP_PORT, HTTP_HOST, () => {
+    logSrv(
+      `[serve] HTTP MCP server 已启动: http://${HTTP_HOST}:${HTTP_PORT}/mcp` +
+        `（OAuth issuer: ${AS_ISSUER}）`
+    );
+    logSrv(`[serve] 接入示例: pi mcp add codebuddy-search --url http://127.0.0.1:${HTTP_PORT}/mcp`);
+  });
+  server.on("error", (e) => {
+    if (e.code === "EADDRINUSE") {
+      logSrv(`[serve] 端口 ${HTTP_PORT} 被占用，请用 PORT=xxx 指定其他端口`);
+    } else {
+      logSrv(`[serve] server error:`, e.message || e);
+    }
+    process.exit(1);
+  });
+}
+
+/** 用当前 CodeBuddy 登录态签发一对 token 给宿主。 */
+async function issueToken(res) {
+  let auth;
+  try {
+    ({ auth } = await ensureCodeBuddyAuth());
+  } catch (e) {
+    return sendJson(res, 400, { error: "invalid_grant", error_description: `CodeBuddy 登录态不可用: ${e.message}` });
+  }
+  const access = b64url(crypto.randomBytes(32));
+  const ttl = tokenTTL(auth);
+  TOKENS.set(access, { codeBuddyAccessToken: auth.accessToken, expiresAt: Date.now() + ttl });
+  const refreshToken = "cbmcp-" + b64url(JSON.stringify({ p: "rt", k: "cb", t: Date.now() }));
+  return sendJson(res, 200, {
+    access_token: access,
+    token_type: "Bearer",
+    expires_in: Math.floor(ttl / 1000),
+    refresh_token: refreshToken,
+    scope: "codebuddy:search",
+  });
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.setEncoding("utf8");
+    req.on("data", (c) => (data += c));
+    req.on("end", () => {
+      try {
+        if (!data) return resolve({});
+        const ct = req.headers["content-type"] || "";
+        if (ct.includes("application/x-www-form-urlencoded") && !ct.includes("json")) {
+          return resolve(Object.fromEntries(new URLSearchParams(data)));
+        }
+        resolve(JSON.parse(data)); // 默认当 JSON（MCP 端点等）
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(body);
+}
+
+function sendHtml(res, status, html) {
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(html);
 }

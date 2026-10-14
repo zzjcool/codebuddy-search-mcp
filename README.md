@@ -132,11 +132,32 @@ agent 会调用 `cb_web_search`，约 2 秒返回结果列表（title / url / sn
 无参数：报告鉴权状态（账号、token 有效期、实际凭据来源；验证失败时也会返回报告与下一步 hint）。
 `trigger_browser_login: true`：触发完整 OAuth 浏览器登录。
 
+## HTTP 模式 + 标准 MCP OAuth（v1.4.0，`pi mcp login` 可用）
+
+stdio server 走不了宿主原生的 OAuth 登录（如 `pi mcp login` 只支持 HTTP server）。v1.4.0 新增 `serve` 子命令：本地起一个 HTTP MCP server，对外实现**标准 MCP OAuth**（RFC 9728 资源元数据 + RFC 7591 动态注册 + RFC 7636 PKCE），对内桥接到 CodeBuddy 浏览器登录流。宿主拿到的 token 即 CodeBuddy token，与 CLI/stdio 三端同源共享。
+
+```bash
+# 1. 启动 HTTP server（常驻，默认 127.0.0.1:3435，PORT 可改）
+codebuddy-search-mcp serve
+
+# 2. 注册到 pi（或其他支持 MCP OAuth 的客户端）
+pi mcp add codebuddy-search --url http://127.0.0.1:3435/mcp
+
+# 3. 宿主原生登录 ✅
+pi mcp login codebuddy-search
+```
+
+登录体验：若本机已有有效 CodeBuddy 登录态（CLI 或 `login` 命令完成过），`pi mcp login` 秒级完成（直接复用，不再开浏览器）；否则会自动拉起 CodeBuddy 授权页，浏览器完成后自动回跳。access token 过期时 pi 会自动用 refresh token 续期（背后转发 CodeBuddy refresh 并同步写回登录态文件）。
+
+端点一览：`POST /mcp`（Streamable HTTP，Bearer 鉴权）、`/.well-known/oauth-protected-resource`、`/.well-known/oauth-authorization-server`、`POST /register`、`GET /authorize`（PKCE S256）、`POST /token`（authorization_code / refresh_token）。
+
+注意：serve 进程重启后已签发 token 失效，重新 `pi mcp login` 即可（客户端注册信息已落盘 `~/.codebuddy-search-mcp/oauth-clients.json`，不会重复注册）。
+
 ## 登录状态感知（v1.3.0）
 
 - MCP 握手（initialize）返回 `instructions`，首行含当前鉴权状态（已登录账号 / 待续期 / 已过期 / 未登录）。支持该字段的宿主（如 pi）会把它放进 system prompt，模型开机即知登录态，不会盲目调用搜索。
 - 进程启动无任何凭据时，stderr 警告同步提示 `npx codebuddy-search-mcp login`。
-- 注意：`pi mcp login` 只支持 HTTP+OAuth server，stdio server 请用上面的终端命令或 `cb_login` 工具登录。
+- 注意：stdio 注册方式请用上面的终端命令或 `cb_login` 工具登录；想用 `pi mcp login` 请改用上文的 HTTP 模式。
 
 ## 配置项（环境变量）
 
