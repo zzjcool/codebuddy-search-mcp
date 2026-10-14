@@ -1,6 +1,6 @@
 {
   "name": "codebuddy-search-mcp",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "CodeBuddy web search / web fetch as a standalone MCP server — direct HTTP, no CLI, built-in OAuth login & auto-refresh",
   "main": "index.js",
   "bin": {

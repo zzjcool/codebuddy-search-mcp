@@ -74,7 +74,14 @@ claude mcp add codebuddy-search -- npx -y codebuddy-search-mcp
 
 **方式 A：MCP 内置 OAuth 登录（推荐）**——不依赖 codebuddy CLI：
 
-重启 MCP 客户端后，让 agent 调用：
+v1.3.0 起支持终端直登（stdio server 无法走宿主如 `pi mcp login`，那只支持 HTTP+OAuth server）：
+
+```bash
+npx codebuddy-search-mcp login    # 发起 OAuth 浏览器登录（等同 codebuddy login）
+npx codebuddy-search-mcp status   # 查看本地鉴权状态
+```
+
+或在 MCP 客户端里让 agent 调用：
 
 ```json
 {"name": "cb_login", "arguments": {"trigger_browser_login": true}}
@@ -122,8 +129,14 @@ agent 会调用 `cb_web_search`，约 2 秒返回结果列表（title / url / sn
 
 ### cb_login
 
-无参数：报告鉴权状态（账号、token 有效期、实际凭据来源）。
+无参数：报告鉴权状态（账号、token 有效期、实际凭据来源；验证失败时也会返回报告与下一步 hint）。
 `trigger_browser_login: true`：触发完整 OAuth 浏览器登录。
+
+## 登录状态感知（v1.3.0）
+
+- MCP 握手（initialize）返回 `instructions`，首行含当前鉴权状态（已登录账号 / 待续期 / 已过期 / 未登录）。支持该字段的宿主（如 pi）会把它放进 system prompt，模型开机即知登录态，不会盲目调用搜索。
+- 进程启动无任何凭据时，stderr 警告同步提示 `npx codebuddy-search-mcp login`。
+- 注意：`pi mcp login` 只支持 HTTP+OAuth server，stdio server 请用上面的终端命令或 `cb_login` 工具登录。
 
 ## 配置项（环境变量）
 
